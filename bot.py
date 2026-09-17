@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -47,6 +48,9 @@ SESSIONS = {}
 # originating WhatsApp number. The `/wa` command remains available if the
 # service restarts before Jarrod replies to an older forwarded message.
 WHATSAPP_REPLY_TARGETS = {}
+# Keeps Renova's automated menu to the first client message only. Subsequent
+# free-form messages are passed quietly to Jarrod through Clair.
+WHATSAPP_CONVERSATIONS = set()
 renova_bot = telebot.TeleBot(RENOVA_TOKEN) if RENOVA_TOKEN else None
 nero_bot = telebot.TeleBot(NERO_TOKEN) if NERO_TOKEN else None
 clair_bot = telebot.TeleBot(CLAIR_TOKEN) if CLAIR_TOKEN else None
@@ -471,6 +475,29 @@ def _whatsapp_message_summary(message):
     return f"{message_type.replace('_', ' ').title()} received."
 
 
+def _download_whatsapp_media(media_id):
+    """Download an incoming WhatsApp attachment for Jarrod's private Clair chat."""
+    if not media_id or not WHATSAPP_ACCESS_TOKEN:
+        return None
+    headers = {"Authorization": f"Bearer {WHATSAPP_ACCESS_TOKEN}"}
+    try:
+        metadata_request = urllib.request.Request(
+            f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{media_id}",
+            headers=headers,
+        )
+        with urllib.request.urlopen(metadata_request, timeout=20) as response:
+            metadata = json.loads(response.read().decode("utf-8"))
+        media_url = metadata.get("url")
+        if not media_url:
+            return None
+        download_request = urllib.request.Request(media_url, headers=headers)
+        with urllib.request.urlopen(download_request, timeout=30) as response:
+            return response.read()
+    except Exception:
+        logger.exception("Could not download WhatsApp media %s for Clair", media_id)
+        return None
+
+
 def _forward_whatsapp_message_to_clair(sender, message, contacts):
     """Deliver client context to Jarrod's private Clair chat for human replies."""
     if not clair_bot:
@@ -494,6 +521,15 @@ def _forward_whatsapp_message_to_clair(sender, message, contacts):
     try:
         forwarded = clair_bot.send_message(CLAIR_ADMIN_ID, admin_message)
         WHATSAPP_REPLY_TARGETS[(CLAIR_ADMIN_ID, forwarded.message_id)] = sender
+        if message.get("type") == "image":
+            media = _download_whatsapp_media(message.get("image", {}).get("id"))
+            if media:
+                image_message = clair_bot.send_photo(
+                    CLAIR_ADMIN_ID,
+                    io.BytesIO(media),
+                    caption=f"📎 Original WhatsApp image from +{sender}",
+                )
+                WHATSAPP_REPLY_TARGETS[(CLAIR_ADMIN_ID, image_message.message_id)] = sender
     except Exception:
         logger.exception("Could not forward WhatsApp client message to Clair admin chat")
 
@@ -522,7 +558,7 @@ def _whatsapp_main_menu(to):
     )
 
 
-def _whatsapp_reply(to, message):
+def _whatsapp_reply(to, message, first_message=False):
     interactive = message.get("interactive", {})
     reply = interactive.get("button_reply", {}) or interactive.get("list_reply", {})
     key = (reply.get("id") or reply.get("title") or message.get("text", {}).get("body") or "").strip().lower()
@@ -555,8 +591,10 @@ def _whatsapp_reply(to, message):
             to,
             "Thank you — your note is received. Please send a screenshot of the completed payment and say whether you selected the 3-question text reading or 15-minute voice note. Jarrod will confirm your reading path.",
         )
-    else:
+    elif key in {"menu", "start", "/start", "help"} or first_message:
         _whatsapp_main_menu(to)
+    else:
+        logger.info("Forwarded WhatsApp message from %s to Clair without automated response", to)
 
 
 def _process_whatsapp_payload(payload):
@@ -568,8 +606,10 @@ def _process_whatsapp_payload(payload):
             for message in value.get("messages", []):
                 sender = message.get("from")
                 if sender:
+                    first_message = sender not in WHATSAPP_CONVERSATIONS
+                    WHATSAPP_CONVERSATIONS.add(sender)
                     _forward_whatsapp_message_to_clair(sender, message, value.get("contacts", []))
-                    _whatsapp_reply(sender, message)
+                    _whatsapp_reply(sender, message, first_message=first_message)
 
 
 class WhatsAppWebhookHandler(BaseHTTPRequestHandler):
