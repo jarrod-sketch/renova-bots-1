@@ -43,6 +43,10 @@ WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 
 SESSIONS = {}
+# Maps a forwarded WhatsApp message in Jarrod's private Clair chat to the
+# originating WhatsApp number. The `/wa` command remains available if the
+# service restarts before Jarrod replies to an older forwarded message.
+WHATSAPP_REPLY_TARGETS = {}
 renova_bot = telebot.TeleBot(RENOVA_TOKEN) if RENOVA_TOKEN else None
 nero_bot = telebot.TeleBot(NERO_TOKEN) if NERO_TOKEN else None
 clair_bot = telebot.TeleBot(CLAIR_TOKEN) if CLAIR_TOKEN else None
@@ -201,6 +205,56 @@ if clair_bot:
             )
 
 
+    def _send_clair_whatsapp_reply(message, recipient, body):
+        if not recipient or not body.strip():
+            clair_bot.send_message(
+                message.chat.id,
+                "I need both a client number and a message before I can send anything to WhatsApp.",
+            )
+            return
+
+        if _whatsapp_text(recipient, body.strip()):
+            clair_bot.send_message(
+                message.chat.id,
+                f"✨ Sent from Renova WhatsApp to +{recipient}.",
+            )
+        else:
+            clair_bot.send_message(
+                message.chat.id,
+                "I could not send that WhatsApp message. Please try once more; if it still fails, check that the client messaged Renova within the last 24 hours.",
+            )
+
+
+    @clair_bot.message_handler(commands=["wa"])
+    def clair_whatsapp_command(message):
+        if not is_clair_admin(message.from_user):
+            return
+
+        command_parts = (message.text or "").split(maxsplit=1)
+        if len(command_parts) < 2:
+            clair_bot.send_message(
+                message.chat.id,
+                "To reply to a client, either reply directly to their forwarded WhatsApp message, or use:\n/wa 614XXXXXXXX Your reply here",
+            )
+            return
+
+        recipient = WHATSAPP_REPLY_TARGETS.get((message.chat.id, getattr(message.reply_to_message, "message_id", None)))
+        if recipient:
+            _send_clair_whatsapp_reply(message, recipient, command_parts[1])
+            return
+
+        recipient, separator, body = command_parts[1].partition(" ")
+        _send_clair_whatsapp_reply(message, "".join(character for character in recipient if character.isdigit()), body if separator else "")
+
+
+    @clair_bot.message_handler(func=lambda message: is_clair_admin(message.from_user) and bool(message.reply_to_message), content_types=["text"])
+    def clair_whatsapp_direct_reply(message):
+        recipient = WHATSAPP_REPLY_TARGETS.get((message.chat.id, message.reply_to_message.message_id))
+        if not recipient:
+            return
+        _send_clair_whatsapp_reply(message, recipient, message.text or "")
+
+
     @clair_bot.message_handler(func=lambda message: True, content_types=["text"])
     def clair_text(message):
         text = message.text or ""
@@ -351,7 +405,7 @@ def _meta_post(payload):
     """Send a service-window WhatsApp message using the Cloud API."""
     if not WHATSAPP_ACCESS_TOKEN or not WHATSAPP_PHONE_NUMBER_ID:
         logger.warning("WhatsApp reply skipped: WHATSAPP_ACCESS_TOKEN is not configured")
-        return
+        return False
 
     url = f"https://graph.facebook.com/{WHATSAPP_GRAPH_VERSION}/{WHATSAPP_PHONE_NUMBER_ID}/messages"
     request = urllib.request.Request(
@@ -366,14 +420,17 @@ def _meta_post(payload):
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             logger.info("WhatsApp reply accepted: %s", response.status)
+            return 200 <= response.status < 300
     except urllib.error.HTTPError as error:
         logger.error("WhatsApp Graph API error %s: %s", error.code, error.read().decode("utf-8", "replace")[:800])
+        return False
     except Exception:
         logger.exception("WhatsApp Graph API request failed")
+        return False
 
 
 def _whatsapp_text(to, body):
-    _meta_post(
+    return _meta_post(
         {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -382,6 +439,63 @@ def _whatsapp_text(to, body):
             "text": {"preview_url": True, "body": body},
         }
     )
+
+
+def _whatsapp_message_summary(message):
+    """Create a readable admin summary without copying untrusted markup into Telegram."""
+    message_type = message.get("type", "message")
+    if message_type == "text":
+        return message.get("text", {}).get("body", "(empty text message)")
+    if message_type == "interactive":
+        interactive = message.get("interactive", {})
+        reply = interactive.get("button_reply", {}) or interactive.get("list_reply", {})
+        return f"Selected: {reply.get('title') or reply.get('id') or 'interactive option'}"
+    if message_type == "image":
+        caption = message.get("image", {}).get("caption", "")
+        return f"Image received{': ' + caption if caption else ''}"
+    if message_type == "document":
+        document = message.get("document", {})
+        filename = document.get("filename", "document")
+        caption = document.get("caption", "")
+        return f"Document received: {filename}{': ' + caption if caption else ''}"
+    if message_type == "audio":
+        return "Audio message received."
+    if message_type == "video":
+        caption = message.get("video", {}).get("caption", "")
+        return f"Video received{': ' + caption if caption else ''}"
+    if message_type == "sticker":
+        return "Sticker received."
+    if message_type == "location":
+        location = message.get("location", {})
+        return f"Location received: {location.get('latitude', '?')}, {location.get('longitude', '?')}"
+    return f"{message_type.replace('_', ' ').title()} received."
+
+
+def _forward_whatsapp_message_to_clair(sender, message, contacts):
+    """Deliver client context to Jarrod's private Clair chat for human replies."""
+    if not clair_bot:
+        return
+
+    profile_name = ""
+    for contact in contacts:
+        if contact.get("wa_id") == sender:
+            profile_name = contact.get("profile", {}).get("name", "")
+            break
+    client_label = profile_name or "WhatsApp client"
+    summary = _whatsapp_message_summary(message)
+    admin_message = (
+        "💬 WHATSAPP CLIENT MESSAGE\n\n"
+        f"From: {client_label}\n"
+        f"Number: +{sender}\n\n"
+        f"{summary}\n\n"
+        "Reply directly to this message to send from Renova WhatsApp. "
+        "For an older message after a restart, use: /wa 614XXXXXXXX Your reply"
+    )
+    try:
+        forwarded = clair_bot.send_message(CLAIR_ADMIN_ID, admin_message)
+        WHATSAPP_REPLY_TARGETS[(CLAIR_ADMIN_ID, forwarded.message_id)] = sender
+    except Exception:
+        logger.exception("Could not forward WhatsApp client message to Clair admin chat")
 
 
 def _whatsapp_main_menu(to):
@@ -454,6 +568,7 @@ def _process_whatsapp_payload(payload):
             for message in value.get("messages", []):
                 sender = message.get("from")
                 if sender:
+                    _forward_whatsapp_message_to_clair(sender, message, value.get("contacts", []))
                     _whatsapp_reply(sender, message)
 
 
