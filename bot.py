@@ -30,9 +30,9 @@ CLAIR_TOKEN = os.getenv("CLAIR_BOT_TOKEN")
 CLAIR_ADMIN_ID = int(os.getenv("CLAIR_ADMIN_ID", "8664218481"))
 CLAIR_ADMIN_USERNAME = "renovaaetherstone"
 
-WEBSITE_URL = "https://www.renovaaetherandstone.com"
-TEXT_URL = os.getenv("STRIPE_TEXT_PAYMENT_URL", "https://book.stripe.com/00wdR24ms9fo5NYcIR18c02")
-VOICE_URL = os.getenv("STRIPE_VOICE_PAYMENT_URL", "https://book.stripe.com/eVqfZaf162R07W64cl18c03")
+WEBSITE_URL = os.getenv("RENOVA_WEBSITE_URL", "https://renovawhats-l2pqw3if.manus.space")
+TEXT_URL = os.getenv("RENOVA_TEXT_READING_URL", f"{WEBSITE_URL}/readings/text")
+VOICE_URL = os.getenv("RENOVA_VOICE_READING_URL", f"{WEBSITE_URL}/readings/voice")
 CLAIR_URL = "https://t.me/ClairAetherBot?start=renova"
 TELEGRAM_GROUP_URL = "https://t.me/+3ClNaQ3t5KJjZTJl"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LTIVL6u2QFl3zEzX2ARKNE"
@@ -141,24 +141,24 @@ if renova_bot:
         elif call.data == "renova_text":
             text = (
                 "🔮 **3-QUESTION TEXT READING — $25 AUD**\n\n"
-                "Please complete payment, then return here and tap **Continue with Clair — RAS**. "
-                "Clair will collect your three questions and send them to Jarrod."
+                "Open the full reading page to see what is included, then continue to secure Stripe checkout. "
+                "After payment, the confirmation page will guide you directly to Clair — RAS."
             )
             menu = InlineKeyboardMarkup(row_width=1)
             menu.add(
-                InlineKeyboardButton("💳 Pay $25 AUD", url=TEXT_URL),
+                InlineKeyboardButton("✨ View & Book — $25 AUD", url=TEXT_URL),
                 InlineKeyboardButton("🌙 Continue with Clair — RAS", url=CLAIR_URL),
                 InlineKeyboardButton("🏠 Main Menu", callback_data="renova_main"),
             )
         elif call.data == "renova_voice":
             text = (
                 "🎙️ **15-MINUTE VOICE NOTE READING — $50 AUD**\n\n"
-                "Please complete payment, then return here and tap **Continue with Clair — RAS**. "
-                "Clair will collect your voice-note request and send it to Jarrod."
+                "Open the full reading page to see what is included, then continue to secure Stripe checkout. "
+                "After payment, the confirmation page will guide you directly to Clair — RAS."
             )
             menu = InlineKeyboardMarkup(row_width=1)
             menu.add(
-                InlineKeyboardButton("💳 Pay $50 AUD", url=VOICE_URL),
+                InlineKeyboardButton("✨ View & Book — $50 AUD", url=VOICE_URL),
                 InlineKeyboardButton("🌙 Continue with Clair — RAS", url=CLAIR_URL),
                 InlineKeyboardButton("🏠 Main Menu", callback_data="renova_main"),
             )
@@ -637,7 +637,7 @@ def _whatsapp_reply(to, message, first_message=False):
             f"{TEXT_URL}\n\n"
             "• 15-Minute Voice Note Reading — $50 AUD\n"
             f"{VOICE_URL}\n\n"
-            "Stripe will confirm successful payment to Jarrod automatically. You are welcome to send your questions or let Jarrod know what you are seeking in the meantime.",
+            "Each page explains what is included before opening secure Stripe checkout. After payment, you will be guided straight to Clair, WhatsApp, SMS or email to send your questions.",
         )
     elif key in {"renova_about", "about renova", "about"}:
         _whatsapp_text(
