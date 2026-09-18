@@ -43,6 +43,12 @@ WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
 WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
+# A private owner alert is optional. Keep the destination in Railway rather
+# than source control, and use the approved utility template once Meta clears
+# it so alerts work after the standard 24-hour WhatsApp service window.
+WHATSAPP_PAYMENT_ALERT_RECIPIENT = os.getenv("WHATSAPP_PAYMENT_ALERT_RECIPIENT", "")
+WHATSAPP_PAYMENT_ALERT_TEMPLATE = os.getenv("WHATSAPP_PAYMENT_ALERT_TEMPLATE", "renova_payment_alert")
+WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE = os.getenv("WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE", "en")
 
 # Stripe sends payment-confirmation events directly to the same Railway service.
 # The signing secret is set only in Railway variables after endpoint registration.
@@ -457,6 +463,54 @@ def _whatsapp_text(to, body):
     )
 
 
+def _send_whatsapp_payment_alert(session):
+    """Mirror a confirmed Stripe payment to Jarrod's private WhatsApp number.
+
+    The template path works outside WhatsApp's 24-hour service window. Until
+    Meta finishes reviewing the template, a service-message fallback still
+    provides the alert while Jarrod's existing conversation window is open.
+    """
+    recipient = WHATSAPP_PAYMENT_ALERT_RECIPIENT.strip().lstrip("+")
+    if not recipient:
+        return True
+
+    details = session.get("customer_details", {}) or {}
+    currency = (session.get("currency") or "aud").upper()
+    total = session.get("amount_total")
+    amount = f"{total / 100:.2f} {currency}" if isinstance(total, int) else "Amount unavailable"
+    client_name = details.get("name") or "Client"
+    service = _stripe_service_name(session)
+    template_payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": recipient,
+        "type": "template",
+        "template": {
+            "name": WHATSAPP_PAYMENT_ALERT_TEMPLATE,
+            "language": {"code": WHATSAPP_PAYMENT_ALERT_TEMPLATE_LANGUAGE},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": client_name},
+                        {"type": "text", "text": amount},
+                        {"type": "text", "text": service},
+                    ],
+                }
+            ],
+        },
+    }
+    if _meta_post(template_payload):
+        return True
+
+    fallback = (
+        "💳 Renova payment confirmed\n\n"
+        f"{client_name} has paid {amount} for {service}.\n"
+        "Check Clair for the full booking details."
+    )
+    return _whatsapp_text(recipient, fallback)
+
+
 def _whatsapp_message_summary(message):
     """Create a readable admin summary without copying untrusted markup into Telegram."""
     message_type = message.get("type", "message")
@@ -690,6 +744,11 @@ def _send_stripe_alert(session, failed=False):
         return False
     try:
         clair_bot.send_message(CLAIR_ADMIN_ID, _format_stripe_payment_alert(session, failed=failed))
+        if not failed and not _send_whatsapp_payment_alert(session):
+            # Clair is the primary, reliable fulfilment alert. A WhatsApp
+            # template can be briefly unavailable while awaiting Meta review;
+            # do not force Stripe to retry and duplicate the Clair message.
+            logger.warning("WhatsApp payment alert was not delivered; Clair alert remains available")
         return True
     except Exception:
         logger.exception("Could not deliver Stripe confirmation to Clair")
