@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,8 +31,8 @@ CLAIR_ADMIN_ID = int(os.getenv("CLAIR_ADMIN_ID", "8664218481"))
 CLAIR_ADMIN_USERNAME = "renovaaetherstone"
 
 WEBSITE_URL = "https://www.renovaaetherandstone.com"
-TEXT_URL = "https://square.link/u/yaq743A5"
-VOICE_URL = "https://square.link/u/oYibDkgK"
+TEXT_URL = os.getenv("STRIPE_TEXT_PAYMENT_URL", "https://book.stripe.com/00wdR24ms9fo5NYcIR18c02")
+VOICE_URL = os.getenv("STRIPE_VOICE_PAYMENT_URL", "https://book.stripe.com/eVqfZaf162R07W64cl18c03")
 CLAIR_URL = "https://t.me/ClairAetherBot?start=renova"
 TELEGRAM_GROUP_URL = "https://t.me/+3ClNaQ3t5KJjZTJl"
 WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LTIVL6u2QFl3zEzX2ARKNE"
@@ -43,6 +44,13 @@ WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "")
 WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
 META_APP_SECRET = os.getenv("META_APP_SECRET", "")
 
+# Stripe sends payment-confirmation events directly to the same Railway service.
+# The signing secret is set only in Railway variables after endpoint registration.
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_WEBHOOK_TOLERANCE_SECONDS = int(os.getenv("STRIPE_WEBHOOK_TOLERANCE_SECONDS", "300"))
+STRIPE_TEXT_PAYMENT_LINK_ID = os.getenv("STRIPE_TEXT_PAYMENT_LINK_ID", "plink_1UH6s12nhVd4f4l355xnZWo7")
+STRIPE_VOICE_PAYMENT_LINK_ID = os.getenv("STRIPE_VOICE_PAYMENT_LINK_ID", "plink_1UH6s22nhVd4f4l3InfDkIOE")
+
 SESSIONS = {}
 # Maps a forwarded WhatsApp message in Jarrod's private Clair chat to the
 # originating WhatsApp number. The `/wa` command remains available if the
@@ -51,6 +59,10 @@ WHATSAPP_REPLY_TARGETS = {}
 # Keeps Renova's automated menu to the first client message only. Subsequent
 # free-form messages are passed quietly to Jarrod through Clair.
 WHATSAPP_CONVERSATIONS = set()
+# Stripe retries webhook deliveries. This prevents duplicate Clair alerts while
+# the deployed instance is running; payment fulfilment itself is a human-led
+# reading workflow, not an irreversible automated delivery.
+STRIPE_PROCESSED_EVENT_IDS = set()
 renova_bot = telebot.TeleBot(RENOVA_TOKEN) if RENOVA_TOKEN else None
 nero_bot = telebot.TeleBot(NERO_TOKEN) if NERO_TOKEN else None
 clair_bot = telebot.TeleBot(CLAIR_TOKEN) if CLAIR_TOKEN else None
@@ -571,7 +583,7 @@ def _whatsapp_reply(to, message, first_message=False):
             f"{TEXT_URL}\n\n"
             "• 15-Minute Voice Note Reading — $50 AUD\n"
             f"{VOICE_URL}\n\n"
-            "After payment, send *paid* here with the reading type you selected. Jarrod will confirm the next step personally.",
+            "Stripe will confirm successful payment to Jarrod automatically. You are welcome to send your questions or let Jarrod know what you are seeking in the meantime.",
         )
     elif key in {"renova_about", "about renova", "about"}:
         _whatsapp_text(
@@ -589,7 +601,7 @@ def _whatsapp_reply(to, message, first_message=False):
     elif key in {"paid", "i paid", "payment sent"}:
         _whatsapp_text(
             to,
-            "Thank you — your note is received. Please send a screenshot of the completed payment and say whether you selected the 3-question text reading or 15-minute voice note. Jarrod will confirm your reading path.",
+            "Thank you. Stripe will securely confirm your payment to Jarrod as soon as it is complete — no screenshot is needed. Please tell me whether you selected the 3-question text reading or 15-minute voice note, and share anything you would like Jarrod to know.",
         )
     elif key in {"menu", "start", "/start", "help"} or first_message:
         _whatsapp_main_menu(to)
@@ -610,6 +622,101 @@ def _process_whatsapp_payload(payload):
                     WHATSAPP_CONVERSATIONS.add(sender)
                     _forward_whatsapp_message_to_clair(sender, message, value.get("contacts", []))
                     _whatsapp_reply(sender, message, first_message=first_message)
+
+
+# ---------------------------------------------------------------------------
+# Stripe Checkout / Payment Link confirmation flow
+# ---------------------------------------------------------------------------
+def _stripe_signature_valid(raw, signature_header):
+    """Verify Stripe's timestamped HMAC signature against the untouched body."""
+    if not STRIPE_WEBHOOK_SECRET or not signature_header:
+        return False
+
+    signatures = {}
+    for part in signature_header.split(","):
+        key, separator, value = part.partition("=")
+        if separator:
+            signatures.setdefault(key, []).append(value)
+
+    try:
+        timestamp = int(signatures.get("t", [""])[0])
+    except ValueError:
+        return False
+    if abs(time.time() - timestamp) > STRIPE_WEBHOOK_TOLERANCE_SECONDS:
+        logger.warning("Stripe webhook rejected: timestamp outside tolerance")
+        return False
+
+    signed_payload = f"{timestamp}.".encode("utf-8") + raw
+    expected = hmac.new(STRIPE_WEBHOOK_SECRET.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, candidate) for candidate in signatures.get("v1", []))
+
+
+def _stripe_service_name(session):
+    """Map Renova's fixed Payment Links to client-friendly service names."""
+    payment_link = session.get("payment_link", "")
+    metadata = session.get("metadata", {}) or {}
+    service = metadata.get("service", "")
+    if payment_link == STRIPE_TEXT_PAYMENT_LINK_ID or service == "three_question_text":
+        return "🔮 3-Question Text Reading — $25 AUD"
+    if payment_link == STRIPE_VOICE_PAYMENT_LINK_ID or service == "fifteen_minute_voice_note":
+        return "🎙️ 15-Minute Voice Note Reading — $50 AUD"
+    return "Renova reading"
+
+
+def _format_stripe_payment_alert(session, failed=False):
+    """Create a concise private Clair alert using Stripe's confirmed data."""
+    details = session.get("customer_details", {}) or {}
+    currency = (session.get("currency") or "aud").upper()
+    total = session.get("amount_total")
+    amount = f"{total / 100:.2f} {currency}" if isinstance(total, int) else "Amount unavailable"
+    client_name = details.get("name") or "Name not supplied"
+    email = details.get("email") or "Email not supplied"
+    phone = details.get("phone") or "Phone not supplied"
+    status = "⚠️ STRIPE PAYMENT NOT COMPLETED" if failed else "💳 STRIPE PAYMENT CONFIRMED"
+    return (
+        f"{status}\n\n"
+        f"Service: {_stripe_service_name(session)}\n"
+        f"Amount: {amount}\n"
+        f"Client: {client_name}\n"
+        f"Email: {email}\n"
+        f"Phone: {phone}\n"
+        f"Checkout Session: {session.get('id', 'Unknown')}"
+    )
+
+
+def _send_stripe_alert(session, failed=False):
+    if not clair_bot:
+        logger.error("Stripe event cannot notify Jarrod: Clair bot is not configured")
+        return False
+    try:
+        clair_bot.send_message(CLAIR_ADMIN_ID, _format_stripe_payment_alert(session, failed=failed))
+        return True
+    except Exception:
+        logger.exception("Could not deliver Stripe confirmation to Clair")
+        return False
+
+
+def _process_stripe_event(event):
+    """Process only the Stripe events Renova needs and keep alerts idempotent."""
+    event_id = event.get("id", "")
+    if event_id and event_id in STRIPE_PROCESSED_EVENT_IDS:
+        return True
+
+    event_type = event.get("type", "")
+    session = event.get("data", {}).get("object", {}) or {}
+    if event_type in {"checkout.session.completed", "checkout.session.async_payment_succeeded"}:
+        if session.get("payment_status") == "unpaid":
+            logger.info("Stripe session %s is not paid yet", session.get("id"))
+            return True
+        handled = _send_stripe_alert(session)
+    elif event_type == "checkout.session.async_payment_failed":
+        handled = _send_stripe_alert(session, failed=True)
+    else:
+        return True
+
+    if handled and event_id:
+        STRIPE_PROCESSED_EVENT_IDS.add(event_id)
+    return handled
 
 
 class WhatsAppWebhookHandler(BaseHTTPRequestHandler):
@@ -636,6 +743,7 @@ class WhatsAppWebhookHandler(BaseHTTPRequestHandler):
                     "phoneNumberConfigured": bool(WHATSAPP_PHONE_NUMBER_ID),
                     "tokenConfigured": bool(WHATSAPP_ACCESS_TOKEN),
                     "appSecretConfigured": bool(META_APP_SECRET),
+                    "stripeWebhookSecretConfigured": bool(STRIPE_WEBHOOK_SECRET),
                 }
             ).encode("utf-8")
             self._respond(200, body, "application/json")
@@ -655,12 +763,38 @@ class WhatsAppWebhookHandler(BaseHTTPRequestHandler):
             self._respond(403, b"Forbidden")
 
     def do_POST(self):
-        if urlparse(self.path).path != "/api/whatsapp/webhook":
+        request_path = urlparse(self.path).path
+        if request_path not in {"/api/whatsapp/webhook", "/api/stripe/webhook"}:
             self._respond(404, b"Not found")
             return
 
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
+
+        if request_path == "/api/stripe/webhook":
+            signature = self.headers.get("Stripe-Signature", "")
+            if not STRIPE_WEBHOOK_SECRET:
+                logger.error("Stripe webhook rejected: STRIPE_WEBHOOK_SECRET is not configured")
+                self._respond(503, b"Stripe webhook security is not configured")
+                return
+            if not _stripe_signature_valid(raw, signature):
+                logger.warning("Stripe webhook rejected: invalid signature")
+                self._respond(400, b"Invalid Stripe signature")
+                return
+            try:
+                event = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._respond(400, b"Invalid JSON")
+                return
+
+            # Return 500 only when the Clair alert failed; Stripe will retry
+            # delivery rather than silently losing a paid booking.
+            if _process_stripe_event(event):
+                self._respond(200, b"EVENT_RECEIVED")
+            else:
+                self._respond(500, b"Could not process Stripe payment event")
+            return
+
         signature = self.headers.get("X-Hub-Signature-256", "")
 
         if not META_APP_SECRET:
