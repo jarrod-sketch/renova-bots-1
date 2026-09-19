@@ -35,7 +35,7 @@ TEXT_URL = os.getenv("RENOVA_TEXT_READING_URL", f"{WEBSITE_URL}/readings/text")
 VOICE_URL = os.getenv("RENOVA_VOICE_READING_URL", f"{WEBSITE_URL}/readings/voice")
 CLAIR_URL = "https://t.me/ClairAetherBot?start=renova"
 TELEGRAM_GROUP_URL = "https://t.me/+3ClNaQ3t5KJjZTJl"
-WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/LTIVL6u2QFl3zEzX2ARKNE"
+WHATSAPP_GROUP_URL = "https://chat.whatsapp.com/BPxijeL9Yx3Lwv7QtVDMD6"
 
 # WhatsApp Cloud API configuration. Set secrets only in Railway variables.
 WHATSAPP_GRAPH_VERSION = os.getenv("WHATSAPP_GRAPH_VERSION", "v26.0")
