@@ -30,7 +30,7 @@ CLAIR_TOKEN = os.getenv("CLAIR_BOT_TOKEN")
 CLAIR_ADMIN_ID = int(os.getenv("CLAIR_ADMIN_ID", "8664218481"))
 CLAIR_ADMIN_USERNAME = "renovaaetherstone"
 
-WEBSITE_URL = os.getenv("RENOVA_WEBSITE_URL", "https://renovawhats-l2pqw3if.manus.space")
+WEBSITE_URL = os.getenv("RENOVA_WEBSITE_URL", "https://www.renovaaetherandstone.com")
 TEXT_URL = os.getenv("RENOVA_TEXT_READING_URL", f"{WEBSITE_URL}/readings/text")
 VOICE_URL = os.getenv("RENOVA_VOICE_READING_URL", f"{WEBSITE_URL}/readings/voice")
 CLAIR_URL = "https://t.me/ClairAetherBot?start=renova"
